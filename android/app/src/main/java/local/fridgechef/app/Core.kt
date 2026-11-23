@@ -271,7 +271,8 @@ class ClaudeClient(private val apiKey: String, private val model: String) {
         fun textBlock(text: String): JSONObject = JSONObject().put("type", "text").put("text", text)
     }
 
-    suspend fun send(content: List<JSONObject>, maxTokens: Int): Reply = withContext(Dispatchers.IO) {
+    /** tool を渡すと、Claude はそのツールの決まった形（JSON）で答え、その中身を文字にして返す */
+    suspend fun send(content: List<JSONObject>, maxTokens: Int, tool: JSONObject? = null): Reply = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) throw ClaudeException("APIキーが未設定です。右上の歯車から設定してください。")
 
         val body = JSONObject()
@@ -282,6 +283,10 @@ class ClaudeClient(private val apiKey: String, private val model: String) {
                     JSONObject().put("role", "user").put("content", JSONArray(content))
                 )
             )
+        if (tool != null) {
+            body.put("tools", JSONArray().put(tool))
+            body.put("tool_choice", JSONObject().put("type", "tool").put("name", tool.getString("name")))
+        }
 
         val conn = (URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -310,11 +315,19 @@ class ClaudeClient(private val apiKey: String, private val model: String) {
                 UsageTracker.record(model, it.optInt("input_tokens"), it.optInt("output_tokens"))
             }
             val blocks = json.optJSONArray("content") ?: JSONArray()
+            val truncated = json.optString("stop_reason") == "max_tokens"
+            // ツールで答えた場合は、その中身（決まった形の JSON）を返す
+            for (i in 0 until blocks.length()) {
+                val b = blocks.optJSONObject(i) ?: continue
+                if (b.optString("type") == "tool_use") {
+                    b.optJSONObject("input")?.let { return@withContext Reply(it.toString(), truncated) }
+                }
+            }
             val text = (0 until blocks.length())
                 .mapNotNull { blocks.optJSONObject(it)?.optString("text")?.ifBlank { null } }
                 .joinToString("\n")
             if (text.isBlank()) throw ClaudeException("返事が空でした。もう一度お試しください。")
-            Reply(text, json.optString("stop_reason") == "max_tokens")
+            Reply(text, truncated)
         } finally {
             conn.disconnect()
         }
@@ -376,14 +389,24 @@ sealed class ConsultKind {
 }
 
 object Prompts {
+    // Claude に決まった形で答えさせるための「ツール」の定義（iPhone 版と同じ内容）
+    val ingredientsTool: JSONObject
+        get() = JSONObject("""
+{"name":"record_ingredients","description":"冷蔵庫の写真から読み取った食材の一覧を記録する","input_schema":{"type":"object","properties":{"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","description":"食材名"},"amount":{"type":"string","description":"おおよその量。分からなければ空文字"},"uncertain":{"type":"boolean","description":"自信がなければ true"}},"required":["name","amount","uncertain"]}}},"required":["ingredients"]}}
+""")
+
+    val menusTool: JSONObject
+        get() = JSONObject("""
+{"name":"record_menus","description":"夕食の献立3組を記録する","input_schema":{"type":"object","properties":{"sets":{"type":"array","description":"献立3組","items":{"type":"object","properties":{"title":{"type":"string","description":"献立の短い呼び名"},"dishes":{"type":"array","items":{"type":"object","properties":{"role":{"type":"string","enum":["主菜","副菜","汁物"]},"name":{"type":"string","description":"料理名"},"uses":{"type":"array","items":{"type":"string"},"description":"使う食材"}},"required":["role","name","uses"]}},"minutes":{"type":"integer","description":"3品全体の調理時間の目安（分）"},"effort":{"type":"string","enum":["かんたん","ふつう","手間あり"]}},"required":["title","dishes","minutes","effort"]}}},"required":["sets"]}}
+""")
+
     fun read(photoCount: Int): String {
         val head = if (photoCount > 1)
             "添付は冷蔵庫の中の写真（${photoCount}枚）です。すべての写真に写っている食材を読み取ってください。同じ食材が複数の写真に写っていたら、1つにまとめてください。"
         else
             "添付は冷蔵庫の中の写真です。写っている食材を読み取ってください。"
         return head + "\n" + """
-次の形式（JSON）だけを返してください。説明文や ``` などの記号は付けないでください。
-{"ingredients":[{"name":"食材名","amount":"おおよその量（分からなければ空文字）","uncertain":false}]}
+結果は record_ingredients ツールで返してください。
 ルール：
 - 自信がない食材は uncertain を true にする。
 - 読み取れないものを推測で補わない。
@@ -429,9 +452,7 @@ object Prompts {
 - 主食（ご飯・パン）は献立に含めない。
 $timeRule$excludeRule
 
-次の形式（JSON）だけを返してください。説明文や ``` などの記号は付けないでください。
-{"sets":[{"title":"献立の短い呼び名","dishes":[{"role":"主菜","name":"料理名","uses":["使う食材"]},{"role":"副菜","name":"料理名","uses":["使う食材"]},{"role":"汁物","name":"料理名","uses":["使う食材"]}],"minutes":40,"effort":"かんたん"}]}
-minutes は3品全体の調理時間の目安（分、数字のみ）。effort は「かんたん」「ふつう」「手間あり」のどれか。
+結果は record_menus ツールで3組まとめて返してください。minutes は3品全体の調理時間の目安（分）です。
 """.trim()
     }
 
