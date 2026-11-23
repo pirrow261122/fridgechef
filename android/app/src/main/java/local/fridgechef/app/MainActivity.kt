@@ -365,17 +365,6 @@ fun ConfirmScreen(vm: AppViewModel) {
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        vm.rawText?.let { raw ->
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("うまく一覧にできませんでした", fontWeight = FontWeight.Bold)
-                    SelectionContainer { Caption(raw) }
-                    Caption("上の文を見ながら、下の欄で食材を手で追加してください。")
-                    HorizontalDivider()
-                }
-            }
-        }
-
         item { Text("冷蔵庫にある食材", fontWeight = FontWeight.Bold) }
 
         items(vm.ingredients, key = { it.id }) { item ->
@@ -568,11 +557,6 @@ fun MenusScreen(vm: AppViewModel) {
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        vm.rawText?.let { raw ->
-            Caption("一覧の形にできなかったため、返事をそのまま表示します。")
-            SelectionContainer { Text(raw) }
-        }
-
         vm.sets.forEachIndexed { index, set ->
             MenuCard(index, set, enabled = !vm.isLoading) { vm.makeDetail(set) }
         }
