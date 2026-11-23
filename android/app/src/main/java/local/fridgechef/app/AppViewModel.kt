@@ -19,7 +19,8 @@ class AppViewModel : ViewModel() {
 
     companion object {
         const val MAX_PHOTOS = 5
-        const val TRUNCATED_NOTE = "返事が長くなりすぎて途中で切れたため、一覧にできませんでした。もう一度ボタンを押してください。"
+        const val READ_FAILED_NOTE = "うまく食材を読み取れませんでした。もう一度押すか、「写真なしで食材を手入力する」で入力してください。"
+        const val MENUS_FAILED_NOTE = "うまく献立を作れませんでした。もう一度押してください。"
     }
 
     var step by mutableStateOf(Step.PHOTO)
@@ -76,18 +77,22 @@ class AppViewModel : ViewModel() {
             val jpegs = withContext(Dispatchers.Default) { photos.map { ImageUtil.jpegForUpload(it) } }
             val content = jpegs.map { ClaudeClient.imageBlock(it) } +
                 ClaudeClient.textBlock(Prompts.read(jpegs.size))
-            val reply = client().send(content, 4000)
-            val parsed = JsonHelper.ingredients(reply.text)
+            // 読み込めなかったら1回だけ自動でやり直す
+            var parsed: List<Ingredient>? = null
+            for (attempt in 0 until 2) {
+                val reply = client().send(content, 4000, Prompts.ingredientsTool)
+                val result = if (reply.truncated) null else JsonHelper.ingredients(reply.text)
+                if (result != null) { parsed = result; break }
+            }
             if (parsed == null) {
-                ingredients.clear()
-                rawText = if (reply.truncated) TRUNCATED_NOTE else reply.text
-                step = Step.CONFIRM
+                errorMessage = READ_FAILED_NOTE
                 return@launchWork
             }
             rawText = null
             ingredients.clear()
             ingredients.addAll(parsed)
-            if (thenMenus) fetchMenus(emptyList()) else step = Step.CONFIRM
+            step = Step.CONFIRM
+            if (thenMenus) fetchMenus(emptyList())
         }
     }
 
@@ -99,16 +104,18 @@ class AppViewModel : ViewModel() {
 
     private suspend fun fetchMenus(exclude: List<String>) {
         val prompt = Prompts.menus(usableIngredients, Store.staples, memo, Store.timeLimit, exclude)
-        val reply = client().send(listOf(ClaudeClient.textBlock(prompt)), 6000)
-        val parsed = JsonHelper.menus(reply.text)
-        if (parsed != null) {
-            sets = parsed
-            rawText = null
-        } else {
-            sets = emptyList()
-            rawText = if (reply.truncated) TRUNCATED_NOTE else reply.text
+        // 読み込めなかったら1回だけ自動でやり直す。それでも駄目なら記号は見せずに案内だけ出す
+        for (attempt in 0 until 2) {
+            val reply = client().send(listOf(ClaudeClient.textBlock(prompt)), 6000, Prompts.menusTool)
+            val parsed = if (reply.truncated) null else JsonHelper.menus(reply.text)
+            if (parsed != null) {
+                sets = parsed
+                rawText = null
+                step = Step.MENUS
+                return
+            }
         }
-        step = Step.MENUS
+        errorMessage = MENUS_FAILED_NOTE
     }
 
     /** 選んだ1組だけ、作り方と買い足しリストを詳しく出す */
