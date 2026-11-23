@@ -1,0 +1,31 @@
+name: Claude usage report
+
+# 毎日 日本時間 9:30 に使用量を確認し、日報をメールで送る（Claude の料金はかからない）
+# 基準を超えたら件名を【警告】にし、対処の手順を付ける
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check usage and send daily report
+        env:
+          ANTHROPIC_ADMIN_KEY: ${{ secrets.ANTHROPIC_ADMIN_KEY }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          # 基準額（ドル）。必要ならここを書き換える
+          DAILY_LIMIT_USD: "0.50"
+          MONTHLY_LIMIT_USD: "3.00"
+          YEN_PER_USD: "150"
+          KEY_EXPIRY_WARN_DAYS: "7"
+        run: python3 scripts/usage_report.py
