@@ -217,20 +217,6 @@ struct ClaudeClient {
     let apiKey: String
     let model: String
 
-    private struct ResponseBody: Decodable {
-        struct Block: Decodable {
-            let type: String
-            let text: String?
-        }
-        struct Usage: Decodable {
-            let input_tokens: Int?
-            let output_tokens: Int?
-        }
-        let content: [Block]
-        let usage: Usage?
-        let stop_reason: String?
-    }
-
     private struct ErrorBody: Decodable {
         struct Detail: Decodable { let message: String }
         let error: Detail
@@ -249,8 +235,10 @@ struct ClaudeClient {
         return ["type": "text", "text": text]
     }
 
-    /// 返事の文章と、上限に達して途中で切れたかどうかを返す
-    func send(content: [[String: Any]], maxTokens: Int) async throws -> (text: String, truncated: Bool) {
+    /// 返事の文章と、上限に達して途中で切れたかどうかを返す。
+    /// tool を渡すと、Claude はそのツールの決まった形（JSON）で答え、その中身を文字にして返す
+    func send(content: [[String: Any]], maxTokens: Int,
+              tool: [String: Any]? = nil) async throws -> (text: String, truncated: Bool) {
         guard !apiKey.isEmpty else { throw ClaudeError.noKey }
 
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
@@ -261,11 +249,15 @@ struct ClaudeClient {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
         let message: [String: Any] = ["role": "user", "content": content]
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
             "messages": [message]
         ]
+        if let tool, let name = tool["name"] as? String {
+            body["tools"] = [tool]
+            body["tool_choice"] = ["type": "tool", "name": name]
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -278,19 +270,47 @@ struct ClaudeClient {
             throw ClaudeError.server("通信エラー（コード \(status)）")
         }
 
-        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ClaudeError.empty
+        }
+        let usage = json["usage"] as? [String: Any]
         UsageTracker.record(model: model,
-                            inputTokens: decoded.usage?.input_tokens ?? 0,
-                            outputTokens: decoded.usage?.output_tokens ?? 0)
-        let text = decoded.content.compactMap { $0.text }.joined(separator: "\n")
+                            inputTokens: usage?["input_tokens"] as? Int ?? 0,
+                            outputTokens: usage?["output_tokens"] as? Int ?? 0)
+        let truncated = (json["stop_reason"] as? String) == "max_tokens"
+        let blocks = json["content"] as? [[String: Any]] ?? []
+
+        // ツールで答えた場合は、その中身（決まった形の JSON）を返す
+        if let toolBlock = blocks.first(where: { ($0["type"] as? String) == "tool_use" }),
+           let input = toolBlock["input"],
+           JSONSerialization.isValidJSONObject(input),
+           let inputData = try? JSONSerialization.data(withJSONObject: input),
+           let inputText = String(data: inputData, encoding: .utf8) {
+            return (inputText, truncated)
+        }
+
+        let text = blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
         guard !text.isEmpty else { throw ClaudeError.empty }
-        return (text, decoded.stop_reason == "max_tokens")
+        return (text, truncated)
     }
 }
 
 // MARK: - 指示文（プロンプト）
 
 enum Prompts {
+    // Claude に決まった形で答えさせるための「ツール」の定義（Android 版と同じ内容）
+    static let ingredientsTool: [String: Any] = parseTool("""
+    {"name":"record_ingredients","description":"冷蔵庫の写真から読み取った食材の一覧を記録する","input_schema":{"type":"object","properties":{"ingredients":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","description":"食材名"},"amount":{"type":"string","description":"おおよその量。分からなければ空文字"},"uncertain":{"type":"boolean","description":"自信がなければ true"}},"required":["name","amount","uncertain"]}}},"required":["ingredients"]}}
+    """)
+
+    static let menusTool: [String: Any] = parseTool("""
+    {"name":"record_menus","description":"夕食の献立3組を記録する","input_schema":{"type":"object","properties":{"sets":{"type":"array","description":"献立3組","items":{"type":"object","properties":{"title":{"type":"string","description":"献立の短い呼び名"},"dishes":{"type":"array","items":{"type":"object","properties":{"role":{"type":"string","enum":["主菜","副菜","汁物"]},"name":{"type":"string","description":"料理名"},"uses":{"type":"array","items":{"type":"string"},"description":"使う食材"}},"required":["role","name","uses"]}},"minutes":{"type":"integer","description":"3品全体の調理時間の目安（分）"},"effort":{"type":"string","enum":["かんたん","ふつう","手間あり"]}},"required":["title","dishes","minutes","effort"]}}},"required":["sets"]}}
+    """)
+
+    private static func parseTool(_ json: String) -> [String: Any] {
+        (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+    }
+
     static func read(photoCount: Int) -> String {
         let head = photoCount > 1
             ? "添付は冷蔵庫の中の写真（\(photoCount)枚）です。すべての写真に写っている食材を読み取ってください。同じ食材が複数の写真に写っていたら、1つにまとめてください。"
@@ -299,8 +319,7 @@ enum Prompts {
     }
 
     private static let readBody = """
-    次の形式（JSON）だけを返してください。説明文や ``` などの記号は付けないでください。
-    {"ingredients":[{"name":"食材名","amount":"おおよその量（分からなければ空文字）","uncertain":false}]}
+    結果は record_ingredients ツールで返してください。
     ルール：
     - 自信がない食材は uncertain を true にする。
     - 読み取れないものを推測で補わない。
@@ -346,9 +365,7 @@ enum Prompts {
         - 主食（ご飯・パン）は献立に含めない。
         \(timeRule)\(excludeRule)
 
-        次の形式（JSON）だけを返してください。説明文や ``` などの記号は付けないでください。
-        {"sets":[{"title":"献立の短い呼び名","dishes":[{"role":"主菜","name":"料理名","uses":["使う食材"]},{"role":"副菜","name":"料理名","uses":["使う食材"]},{"role":"汁物","name":"料理名","uses":["使う食材"]}],"minutes":40,"effort":"かんたん"}]}
-        minutes は3品全体の調理時間の目安（分、数字のみ）。effort は「かんたん」「ふつう」「手間あり」のどれか。
+        結果は record_menus ツールで3組まとめて返してください。minutes は3品全体の調理時間の目安（分）です。
         """
     }
 
@@ -473,7 +490,8 @@ final class AppModel: ObservableObject {
     @Published var rawText: String?
     @Published var isLoading = false
     @Published var errorMessage: String?
-    static let truncatedNote = "返事が長くなりすぎて途中で切れたため、一覧にできませんでした。もう一度ボタンを押してください。"
+    static let readFailedNote = "うまく食材を読み取れませんでした。もう一度押すか、「写真なしで食材を手入力する」で入力してください。"
+    static let menusFailedNote = "うまく献立を作れませんでした。もう一度押してください。"
 
     @Published var monthUSD: Double = UsageTracker.monthUSD
     @Published var totalUSD: Double = UsageTracker.totalUSD
@@ -515,21 +533,28 @@ final class AppModel: ObservableObject {
         await run {
             let content = jpegs.map { ClaudeClient.imageBlock($0) }
                 + [ClaudeClient.textBlock(Prompts.read(photoCount: jpegs.count))]
-            let reply = try await client.send(content: content, maxTokens: 4000)
-            guard let parsed = JSONHelper.decode(IngredientResponse.self, from: reply.text) else {
-                ingredients = []
-                rawText = reply.truncated ? AppModel.truncatedNote : reply.text
-                step = .confirm
+            // 読み込めなかったら1回だけ自動でやり直す
+            var parsed: IngredientResponse?
+            for _ in 0..<2 {
+                let reply = try await client.send(content: content, maxTokens: 4000,
+                                                  tool: Prompts.ingredientsTool)
+                if !reply.truncated,
+                   let result = JSONHelper.decode(IngredientResponse.self, from: reply.text) {
+                    parsed = result
+                    break
+                }
+            }
+            guard let parsed else {
+                errorMessage = AppModel.readFailedNote
                 return
             }
             rawText = nil
             ingredients = parsed.ingredients.map {
                 Ingredient(name: $0.name, amount: $0.amount ?? "", uncertain: $0.uncertain ?? false)
             }
+            step = .confirm
             if thenMenus {
                 try await fetchMenus(exclude: [])
-            } else {
-                step = .confirm
             }
         }
     }
@@ -545,15 +570,20 @@ final class AppModel: ObservableObject {
     private func fetchMenus(exclude: [String]) async throws {
         let prompt = Prompts.menus(ingredients: usableIngredients, staples: Staples.load(),
                                    memo: memo, timeLimit: timeLimit, exclude: exclude)
-        let reply = try await client.send(content: [ClaudeClient.textBlock(prompt)], maxTokens: 6000)
-        if let parsed = JSONHelper.decode(MenuResponse.self, from: reply.text), !parsed.sets.isEmpty {
-            sets = parsed.sets
-            rawText = nil
-        } else {
-            sets = []
-            rawText = reply.truncated ? AppModel.truncatedNote : reply.text
+        // 読み込めなかったら1回だけ自動でやり直す。それでも駄目なら記号は見せずに案内だけ出す
+        for _ in 0..<2 {
+            let reply = try await client.send(content: [ClaudeClient.textBlock(prompt)], maxTokens: 6000,
+                                              tool: Prompts.menusTool)
+            if !reply.truncated,
+               let parsed = JSONHelper.decode(MenuResponse.self, from: reply.text),
+               !parsed.sets.isEmpty {
+                sets = parsed.sets
+                rawText = nil
+                step = .menus
+                return
+            }
         }
-        step = .menus
+        errorMessage = AppModel.menusFailedNote
     }
 
     /// 選んだ1組だけ、作り方と買い足しリストを詳しく出す
@@ -933,16 +963,6 @@ struct ConfirmStepView: View {
 
     var body: some View {
         List {
-            if let raw = model.rawText {
-                Section {
-                    Text(raw).font(.caption).textSelection(.enabled)
-                } header: {
-                    Text("うまく一覧にできませんでした")
-                } footer: {
-                    Text("上の文を見ながら、下の欄で食材を手で追加してください。")
-                }
-            }
-
             Section {
                 ForEach($model.ingredients) { $item in
                     HStack(alignment: .center, spacing: 10) {
@@ -1134,12 +1154,6 @@ struct MenusStepView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                if let raw = model.rawText {
-                    Text("一覧の形にできなかったため、返事をそのまま表示します。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(raw).textSelection(.enabled)
-                }
 
                 ForEach(Array(model.sets.enumerated()), id: \.offset) { index, set in
                     Button {
