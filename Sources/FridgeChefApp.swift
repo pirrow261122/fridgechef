@@ -291,8 +291,14 @@ struct ClaudeClient {
 // MARK: - 指示文（プロンプト）
 
 enum Prompts {
-    static let read = """
-    添付は冷蔵庫の中の写真です。写っている食材を読み取ってください。
+    static func read(photoCount: Int) -> String {
+        let head = photoCount > 1
+            ? "添付は冷蔵庫の中の写真（\(photoCount)枚）です。すべての写真に写っている食材を読み取ってください。同じ食材が複数の写真に写っていたら、1つにまとめてください。"
+            : "添付は冷蔵庫の中の写真です。写っている食材を読み取ってください。"
+        return head + "\n" + readBody
+    }
+
+    private static let readBody = """
     次の形式（JSON）だけを返してください。説明文や ``` などの記号は付けないでください。
     {"ingredients":[{"name":"食材名","amount":"おおよその量（分からなければ空文字）","uncertain":false}]}
     ルール：
@@ -368,17 +374,18 @@ enum Prompts {
 // MARK: - 「AI本体で相談する」の依頼文
 
 enum ConsultKind {
-    case feast          // A 週末のごちそう
-    case upgrade        // B 選んだ献立を格上げ
-    case centerpiece    // C 主役の一品
-    case genre(String)  // D ジャンル指定
+    case threeSets          // 食材の確認画面から：献立3組を考えてもらう
+    case feast              // 週末のごちそう
+    case upgrade(MenuSet)   // 指定した献立を格上げ
+    case centerpiece        // 主役の一品
+    case genre(String)      // ジャンル指定
 
     static let genres = ["和食", "洋食", "中華", "エスニック"]
 }
 
 extension Prompts {
     static func consult(kind: ConsultKind, ingredients: [Ingredient], staples: [String],
-                        memo: String, selected: MenuSet?) -> String {
+                        memo: String) -> String {
         let common = """
         【冷蔵庫にある食材】\(fridgeListPublic(ingredients))
         【いつもある物】\(staples.joined(separator: "、"))
@@ -386,16 +393,23 @@ extension Prompts {
         """
         let request: String
         switch kind {
+        case .threeSets:
+            request = """
+            冷蔵庫の食材を使って、4人家族の夕食の献立を3組考えてください。
+            - 「主菜・副菜・汁物」を1組とする。主菜がシチュー、カレー、鍋物など汁物を兼ねる場合は汁物は不要。
+            - 副菜は簡単なもの（おひたし、あえ物、浅漬けなど）でよい。
+            - 冷蔵庫の食材をできるだけ使い切り、買い足しはなるべく少なくする。
+            - 3組は和・洋・中などの系統が偏らないようにする。
+            各組について、料理名、使う食材、調理時間の目安、買い足しリストを書いてください。気に入った組があれば、続けて作り方を聞きます。
+            """
         case .feast:
             request = """
             週末に時間と手間をかけて作る、お店のような本格的なごちそう献立（主菜・副菜・汁物）を考えてください。
             冷蔵庫の食材をできるだけ生かし、足りない物は買い足しリストにまとめてください。
             下ごしらえから仕上げまでの段取りを時間の流れで示し、各料理の材料（4人分）と作り方を書いてください。
             """
-        case .upgrade:
-            let dishes = selected.map { set in
-                set.dishes.map { "\($0.role)：\($0.name)" }.joined(separator: "、")
-            } ?? "（未選択）"
+        case .upgrade(let set):
+            let dishes = set.dishes.map { "\($0.role)：\($0.name)" }.joined(separator: "、")
             request = """
             次の献立を、家庭で一段おいしく、見た目も華やかにする方法を教えてください。
             【献立】\(dishes)
@@ -444,7 +458,13 @@ final class AppModel: ObservableObject {
     enum Step { case photo, confirm, menus, detail }
 
     @Published var step: Step = .photo
-    @Published var image: UIImage?
+    @Published var images: [UIImage] = []
+    static let maxPhotos = 5
+
+    func addImage(_ image: UIImage) {
+        guard images.count < AppModel.maxPhotos else { return }
+        images.append(image)
+    }
     @Published var memo = ""
     @Published var ingredients: [Ingredient] = []
     @Published var sets: [MenuSet] = []
@@ -490,11 +510,12 @@ final class AppModel: ObservableObject {
 
     /// 1段階目：写真から食材を読み取る。thenMenus が true なら確認を飛ばして献立まで進む
     func readIngredients(thenMenus: Bool) async {
-        guard let image, let jpeg = image.jpegForUpload() else { return }
+        let jpegs = images.compactMap { $0.jpegForUpload() }
+        guard !jpegs.isEmpty else { return }
         await run {
-            let reply = try await client.send(
-                content: [ClaudeClient.imageBlock(jpeg), ClaudeClient.textBlock(Prompts.read)],
-                maxTokens: 4000)
+            let content = jpegs.map { ClaudeClient.imageBlock($0) }
+                + [ClaudeClient.textBlock(Prompts.read(photoCount: jpegs.count))]
+            let reply = try await client.send(content: content, maxTokens: 4000)
             guard let parsed = JSONHelper.decode(IngredientResponse.self, from: reply.text) else {
                 ingredients = []
                 rawText = reply.truncated ? AppModel.truncatedNote : reply.text
@@ -552,7 +573,7 @@ final class AppModel: ObservableObject {
     /// 「AI本体で相談する」用の依頼文を作る（Claudeの鍵は使わない）
     func consultPrompt(_ kind: ConsultKind) -> String {
         Prompts.consult(kind: kind, ingredients: usableIngredients, staples: Staples.load(),
-                        memo: memo, selected: selected)
+                        memo: memo)
     }
 
     func addIngredient(_ name: String) {
@@ -573,7 +594,7 @@ final class AppModel: ObservableObject {
 
     func reset() {
         step = .photo
-        image = nil
+        images = []
         memo = ""
         ingredients = []
         sets = []
@@ -587,7 +608,7 @@ final class AppModel: ObservableObject {
 // MARK: - カメラ画面
 
 struct CameraPicker: UIViewControllerRepresentable {
-    @Binding var image: UIImage?
+    let onPick: (UIImage) -> Void
     @Binding var isPresented: Bool
 
     func makeUIViewController(context: Context) -> UIImagePickerController {
@@ -607,7 +628,9 @@ struct CameraPicker: UIViewControllerRepresentable {
 
         func imagePickerController(_ picker: UIImagePickerController,
                                    didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
-            parent.image = info[.originalImage] as? UIImage
+            if let picked = info[.originalImage] as? UIImage {
+                parent.onPick(picked)
+            }
             parent.isPresented = false
         }
 
@@ -781,25 +804,48 @@ struct UsageBar: View {
 struct PhotoStepView: View {
     @ObservedObject var model: AppModel
     @Binding var showCamera: Bool
-    @State private var pickerItem: PhotosPickerItem?
+    @State private var pickerItems: [PhotosPickerItem] = []
+
+    private var remaining: Int { AppModel.maxPhotos - model.images.count }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 UsageBar(model: model)
 
-                if let image = model.image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxHeight: 280)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else {
+                if model.images.isEmpty {
                     RoundedRectangle(cornerRadius: 12)
                         .fill(Color.gray.opacity(0.15))
                         .frame(height: 160)
                         .overlay(Text("冷蔵庫の写真がまだありません").foregroundStyle(.secondary))
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(Array(model.images.enumerated()), id: \.offset) { index, image in
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 140, height: 190)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                    .overlay(alignment: .topTrailing) {
+                                        Button {
+                                            model.images.remove(at: index)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .font(.title2)
+                                                .symbolRenderingMode(.palette)
+                                                .foregroundStyle(Color.white, Color.black.opacity(0.6))
+                                        }
+                                        .padding(6)
+                                    }
+                            }
+                        }
+                    }
                 }
+
+                Text("写真 \(model.images.count) / \(AppModel.maxPhotos) 枚（冷蔵室・野菜室・冷凍室・扉のポケットなどを分けて撮れます）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 HStack {
                     Button {
@@ -809,14 +855,19 @@ struct PhotoStepView: View {
                             model.errorMessage = "この端末ではカメラが使えません。"
                         }
                     } label: {
-                        Label("撮影する", systemImage: "camera").frame(maxWidth: .infinity)
+                        Label(model.images.isEmpty ? "撮影する" : "もう1枚撮る", systemImage: "camera")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .disabled(remaining <= 0)
 
-                    PhotosPicker(selection: $pickerItem, matching: .images) {
+                    PhotosPicker(selection: $pickerItems,
+                                 maxSelectionCount: max(remaining, 1),
+                                 matching: .images) {
                         Label("写真を選ぶ", systemImage: "photo").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .disabled(remaining <= 0)
                 }
 
                 TextField("メモ（例：今日は6人分、魚は避けたい）", text: $model.memo, axis: .vertical)
@@ -831,7 +882,7 @@ struct PhotoStepView: View {
                         .padding(.vertical, 6)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.image == nil || model.isLoading)
+                .disabled(model.images.isEmpty || model.isLoading)
 
                 Button {
                     Task { await model.readIngredients(thenMenus: true) }
@@ -840,7 +891,7 @@ struct PhotoStepView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(model.image == nil || model.isLoading)
+                .disabled(model.images.isEmpty || model.isLoading)
 
                 Button {
                     model.ingredients = []
@@ -859,13 +910,16 @@ struct PhotoStepView: View {
             }
             .padding()
         }
-        .onChange(of: pickerItem) { newItem in
-            guard let newItem else { return }
+        .onChange(of: pickerItems) { items in
+            guard !items.isEmpty else { return }
             Task {
-                if let data = try? await newItem.loadTransferable(type: Data.self),
-                   let picked = UIImage(data: data) {
-                    model.image = picked
+                for item in items {
+                    if let data = try? await item.loadTransferable(type: Data.self),
+                       let picked = UIImage(data: data) {
+                        model.addImage(picked)
+                    }
                 }
+                pickerItems = []
             }
         }
     }
@@ -944,6 +998,12 @@ struct ConfirmStepView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isLoading)
             }
+
+            Section {
+                AIConsultButton(model: model, mode: .confirm)
+            } footer: {
+                Text("確認した食材で、AI のアプリに献立3組を考えてもらう依頼文を作ります。このアプリの料金はかかりません。")
+            }
         }
     }
 
@@ -961,14 +1021,22 @@ struct ConsultDraft: Identifiable {
 }
 
 struct AIConsultButton: View {
+    enum Mode { case confirm, menus, detail }
+
     @ObservedObject var model: AppModel
-    let allowUpgrade: Bool
+    let mode: Mode
     @State private var showChoices = false
     @State private var draft: ConsultDraft?
 
+    private let letters = ["A", "B", "C", "D", "E"]
+
     var body: some View {
         Button {
-            showChoices = true
+            if mode == .confirm {
+                open(.threeSets)
+            } else {
+                showChoices = true
+            }
         } label: {
             Label("AI本体で相談する", systemImage: "bubble.left.and.text.bubble.right")
                 .frame(maxWidth: .infinity)
@@ -976,10 +1044,17 @@ struct AIConsultButton: View {
         .buttonStyle(.bordered)
         .disabled(model.isLoading)
         .confirmationDialog("どんな相談をしますか？", isPresented: $showChoices, titleVisibility: .visible) {
-            Button("週末のごちそう") { open(.feast) }
-            if allowUpgrade {
-                Button("選んだ献立を格上げ") { open(.upgrade) }
+            if mode == .menus {
+                ForEach(Array(model.sets.enumerated()), id: \.offset) { index, set in
+                    Button(upgradeLabel(index: index, set: set)) {
+                        open(.upgrade(set))
+                    }
+                }
             }
+            if mode == .detail, let set = model.selected {
+                Button("選んだ献立を格上げ") { open(.upgrade(set)) }
+            }
+            Button("週末のごちそう") { open(.feast) }
             Button("主役の一品") { open(.centerpiece) }
             ForEach(ConsultKind.genres, id: \.self) { genre in
                 Button("ジャンル指定：\(genre)") { open(.genre(genre)) }
@@ -991,6 +1066,11 @@ struct AIConsultButton: View {
         .sheet(item: $draft) { item in
             ConsultSheet(text: item.text)
         }
+    }
+
+    private func upgradeLabel(index: Int, set: MenuSet) -> String {
+        let letter = index < letters.count ? letters[index] : String(index + 1)
+        return letter + "案「" + set.title + "」を格上げ"
     }
 
     private func open(_ kind: ConsultKind) {
@@ -1086,7 +1166,7 @@ struct MenusStepView: View {
                 .buttonStyle(.bordered)
                 .disabled(model.isLoading)
 
-                AIConsultButton(model: model, allowUpgrade: false)
+                AIConsultButton(model: model, mode: .menus)
             }
             .padding()
         }
@@ -1175,7 +1255,7 @@ struct DetailStepView: View {
                     .buttonStyle(.bordered)
                 }
 
-                AIConsultButton(model: model, allowUpgrade: true)
+                AIConsultButton(model: model, mode: .detail)
 
                 Text("※食材の読み取りや作り方は間違うことがあります。傷み具合や火の通りは、最後にご自身の目で確かめてください。")
                     .font(.caption)
@@ -1253,7 +1333,7 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings, onDismiss: { model.refreshUsage() }) { SettingsView() }
             .fullScreenCover(isPresented: $showCamera) {
-                CameraPicker(image: $model.image, isPresented: $showCamera).ignoresSafeArea()
+                CameraPicker(onPick: { model.addImage($0) }, isPresented: $showCamera).ignoresSafeArea()
             }
         }
     }
