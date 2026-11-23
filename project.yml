@@ -1,0 +1,30 @@
+name: FridgeChef
+options:
+  bundleIdPrefix: local.fridgechef
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  FridgeChef:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - Resources
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.fridgechef.app
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_CFBundleDisplayName: 冷蔵庫シェフ
+        INFOPLIST_KEY_NSCameraUsageDescription: 冷蔵庫の中を撮影して食材を読み取るためにカメラを使います。
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: 撮影済みの写真から食材を読み取るために写真を使います。
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
