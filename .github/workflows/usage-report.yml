@@ -26,6 +26,6 @@ jobs:
           # 基準額（ドル）。必要ならここを書き換える
           DAILY_LIMIT_USD: "0.50"
           MONTHLY_LIMIT_USD: "3.00"
-          YEN_PER_USD: "150"
+          YEN_PER_USD: "160"
           KEY_EXPIRY_WARN_DAYS: "7"
         run: python3 scripts/usage_report.py
